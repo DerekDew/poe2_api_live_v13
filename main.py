@@ -1,111 +1,128 @@
 import os
-import requests
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
+from typing import List
 
-# ===== Env Vars =====
-REALM = os.getenv("REALM", "poe2")
+import requests
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import quote
+
+# ========= Config via env =========
+REALM = os.getenv("REALM", "poe2")  # poe1|poe2
 LEAGUE = os.getenv("LEAGUE", "Dawn of the Hunt")
-QUERY_ID = os.getenv("QUERY_ID", "")
+QUERY_ID = os.getenv("QUERY_ID", "")  # the saved search id from /trade2/search/.../<id>
 USER_AGENT = os.getenv("USER_AGENT", "poe2-flips/0.13 (contact: you@example.com)")
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "30"))
 DIVINE_TO_CHAOS = float(os.getenv("DIVINE_TO_CHAOS", "180"))
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 
-# ===== API Setup =====
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+}
+
+# ========= FastAPI app + CORS =========
 app = FastAPI()
 
-# CORS
 if CORS_ORIGINS == "*":
-    origins = ["*"]
+    allow_origins = ["*"]
 else:
-    origins = [o.strip() for o in CORS_ORIGINS.split(",")]
+    allow_origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===== Helper Functions =====
-def fetch_trade_data():
-    """Fetch raw trade data from PoE trade API."""
-    if not QUERY_ID:
-        return []
+# ========= Helpers =========
+def api_search(realm: str, league: str, query_id: str):
+    """
+    For saved searches, PoE2 supports:
+    GET /api/trade2/search/{realm}/{league}/{id}
+    Response includes "result": [<listing ids>]
+    """
+    if not query_id:
+        return {"result": []}
 
-    url = f"https://www.pathofexile.com/api/trade2/fetch/{QUERY_ID}"
-    search_url = f"https://www.pathofexile.com/api/trade2/search/{REALM}/{LEAGUE}/{QUERY_ID}"
-    try:
-        # Get search results
-        search_resp = requests.get(search_url, headers={"User-Agent": USER_AGENT}, timeout=15)
-        search_resp.raise_for_status()
-        data = search_resp.json()
+    league_enc = quote(league, safe="")
+    url = f"https://www.pathofexile.com/api/trade2/search/{realm}/{league_enc}/{query_id}"
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-        if "result" not in data or not data["result"]:
-            return []
+def api_fetch(ids: List[str], query_id: str):
+    """
+    Fetch listing details. Must pass the listing IDs AND ?query=<id>
+    GET /api/trade2/fetch/{id1,id2,...}?query=<search id>
+    """
+    if not ids:
+        return {"result": []}
+    url = f"https://www.pathofexile.com/api/trade2/fetch/{','.join(ids)}?query={query_id}"
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-        # Limit results
-        result_ids = data["result"][:FETCH_LIMIT]
+def map_result_to_deal(res_item: dict):
+    listing = res_item.get("listing", {})
+    item = res_item.get("item", {}) or {}
+    price = listing.get("price", {}) or {}
 
-        # Fetch details for the results
-        fetch_url = f"https://www.pathofexile.com/api/trade2/fetch/{','.join(result_ids)}"
-        fetch_resp = requests.get(fetch_url, headers={"User-Agent": USER_AGENT}, timeout=15)
-        fetch_resp.raise_for_status()
-        fetched_data = fetch_resp.json()
+    amount = price.get("amount")
+    currency = price.get("currency")
+    price_str = f"{amount}{currency}" if amount is not None and currency else ""
 
-        return fetched_data.get("result", [])
+    return {
+        "id": res_item.get("id"),
+        "name": item.get("name") or "",
+        "baseType": item.get("typeLine") or "",
+        "price": amount,
+        "currency": currency,
+        "priceStr": price_str,
+        "estimate": None,      # left blank for now (no filtering)
+        "marginPct": None,     # left blank for now (no filtering)
+        "score": None,         # left blank for now (no filtering)
+        "seller": (listing.get("account") or {}).get("name", ""),
+        "listedAt": listing.get("indexed"),
+        "seenAt": listing.get("indexed"),
+        "tradeUrl": f"https://www.pathofexile.com/trade2/search/{REALM}/{quote(LEAGUE, safe='')}/{QUERY_ID}",
+    }
 
-    except Exception as e:
-        print("Error fetching trade data:", e)
-        return []
-
-def parse_deals(raw_items):
-    """Parse trade API items into a simple list — no filtering."""
-    deals = []
-    for it in raw_items:
-        listing = it.get("listing", {})
-        price = listing.get("price", {})
-        amount = price.get("amount")
-        currency = price.get("currency")
-
-        deals.append({
-            "id": it.get("id"),
-            "name": it.get("item", {}).get("name") or "",
-            "baseType": it.get("item", {}).get("typeLine") or "",
-            "price": amount,
-            "currency": currency,
-            "priceStr": f"{amount}{currency}" if amount and currency else "",
-            "estimate": None,  # Placeholder — logic removed for simplicity
-            "marginPct": None, # No margin filtering
-            "score": None,     # No score filtering
-            "seller": listing.get("account", {}).get("name", ""),
-            "listedAt": listing.get("indexed"),
-            "tradeUrl": f"https://www.pathofexile.com/trade2/search/{REALM}/{LEAGUE}/{QUERY_ID}"
-        })
-    return deals
-
-# ===== Routes =====
+# ========= Routes =========
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "time": datetime.utcnow().isoformat(),
+        "time": datetime.utcnow().isoformat() + "Z",
         "realm": REALM,
         "league": LEAGUE,
-        "query_id": QUERY_ID
+        "query_id": QUERY_ID,
     }
 
 @app.get("/deals")
-def get_deals(limit: int = FETCH_LIMIT):
-    raw_items = fetch_trade_data()
-    deals = parse_deals(raw_items)
-    # Just slice for requested limit
-    return {"items": deals[:limit]}
+def deals(limit: int = Query(FETCH_LIMIT, ge=1, le=100)):
+    """
+    Returns raw listings from PoE2 for the saved search identified by QUERY_ID.
+    No server-side filtering; just maps to a simple shape for the frontend.
+    """
+    try:
+        search_data = api_search(REALM, LEAGUE, QUERY_ID)
+        ids = (search_data.get("result") or [])[:limit]
+        if not ids:
+            return {"items": []}
+
+        fetch_data = api_fetch(ids, QUERY_ID)
+        results = fetch_data.get("result") or []
+        mapped = [map_result_to_deal(r) for r in results]
+        return {"items": mapped[:limit]}
+    except requests.HTTPError as e:
+        return {"items": [], "error": f"http_error:{e.response.status_code}"}
+    except Exception as e:
+        return {"items": [], "error": f"exception:{type(e).__name__}"}
 
 @app.get("/history")
 def history(id: str):
-    # This is just a placeholder — history logic would be added here if needed
+    # Placeholder history endpoint
     return {"id": id, "history": []}
